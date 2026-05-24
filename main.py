@@ -8,9 +8,20 @@ from direct.actor.Actor import Actor
 from panda3d.core import Texture as PandaTexture
 
 # ==============================================================================
-# 1. THREAD AI TRACKING
+# KONFIGURASI (UBAH DI SINI)
 # ==============================================================================
-class MocapAIThread(threading.Thread):
+SMOOTH = 0.25
+
+# Offset Sudut (sesuaikan ini)
+L_UPPER_OFFSET = 90
+L_LOWER_OFFSET = 0
+R_UPPER_OFFSET = 90
+R_LOWER_OFFSET = 0
+
+# ==============================================================================
+# THREAD MEDIA PIPE
+# ==============================================================================
+class MocapThread(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self.cap = cv2.VideoCapture(0)
@@ -18,81 +29,63 @@ class MocapAIThread(threading.Thread):
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         
         self.mp_pose = mp.solutions.pose
-        self.pose = self.mp_pose.Pose(
-            min_detection_confidence=0.75,
-            min_tracking_confidence=0.75,
-            model_complexity=1
-        )
+        self.pose = self.mp_pose.Pose(min_detection_confidence=0.6, min_tracking_confidence=0.6)
         
         self.pose_detected = False
         self.running = True
         self.frame_lock = threading.Lock()
         
-        # Sudut
-        self.angle_l_upper = 0.0
-        self.angle_l_lower = 0.0
-        self.angle_r_upper = 0.0
-        self.angle_r_lower = 0.0
+        self.l_upper = 0.0
+        self.l_lower = 0.0
+        self.r_upper = 0.0
+        self.r_lower = 0.0
         
         self.current_frame = None
 
     def run(self):
-        print("[INFO] Mocap Thread Started")
         mp_drawing = mp.solutions.drawing_utils
 
         while self.running:
             success, frame = self.cap.read()
             if not success:
-                time.sleep(0.01)
                 continue
 
             frame = cv2.flip(frame, 1)
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = self.pose.process(rgb_frame)
+            results = self.pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
             if results.pose_landmarks:
-                self.pose_detected = True
                 lm = results.pose_landmarks.landmark
-                
-                required_landmarks = [11, 13, 15, 12, 14, 16]
-                
-                all_joints_visible = all(lm[idx].visibility > 0.8 for idx in required_landmarks)
-                
-                if all_joints_visible:
+                if all(lm[i].visibility > 0.7 for i in [11,13,15,12,14,16]):
                     self.pose_detected = True
-                    
                     mp_drawing.draw_landmarks(frame, results.pose_landmarks, self.mp_pose.POSE_CONNECTIONS)
 
-                    # ==================== LENGAN KIRI ====================
-                    bahu_l = lm[11]
-                    siku_l  = lm[13]
-                    pergelangan_l = lm[15]
+                    # Perhitungan Sudut Sederhana
+                    
+                    # Lengan Kiri
+                    l_upper_angle = math.degrees(math.atan2(lm[13].y - lm[11].y, lm[13].x - lm[11].x))
+                    self.l_upper = normalize_angle(-l_upper_angle - 90)
+                    
+                    self.l_lower = math.degrees(math.atan2(lm[15].y - lm[13].y, lm[15].x - lm[13].x)) - 90
 
-                    # Upper Arm (Bahu - Siku)
-                    self.angle_l_upper = math.degrees(math.atan2(siku_l.y - bahu_l.y, siku_l.x - bahu_l.x)) - 90
+                    # Lengan Kanan
 
-                    # Lower Arm / Forearm (Siku - Pergelangan)
-                    vec1 = (siku_l.x - bahu_l.x, siku_l.y - bahu_l.y)
-                    vec2 = (pergelangan_l.x - siku_l.x, pergelangan_l.y - siku_l.y)
-                    angle_lower = math.degrees(math.atan2(vec2[1], vec2[0]) - math.atan2(vec1[1], vec1[0]))
-                    self.angle_l_lower = angle_lower
+                    r_upper_raw = math.degrees(math.atan2(lm[14].y - lm[12].y, lm[14].x - lm[12].x))
+                    self.r_upper = normalize_angle(-r_upper_raw - 90)
+                    self.r_lower = math.degrees(math.atan2(lm[16].y - lm[14].y, lm[16].x - lm[14].x)) - 90
+                    
+                    print(self.r_upper)
+                    
+                    # Simpan data untuk debug
+                    self.debug_data = {
+                        'r_shoulder': (lm[12].x, lm[12].y),
+                        'r_elbow':    (lm[14].x, lm[14].y),
+                        'r_wrist':    (lm[16].x, lm[16].y),
+                        'r_upper_raw': r_upper_raw,
+                        'r_upper_final': self.r_upper
+                    }
 
-                    # ==================== LENGAN KANAN ====================
-                    bahu_r = lm[12]
-                    siku_r  = lm[14]
-                    pergelangan_r = lm[16]
-
-                    self.angle_r_upper = math.degrees(math.atan2(siku_r.y - bahu_r.y, siku_r.x - bahu_r.x)) - 90
-                    self.angle_r_upper = -self.angle_r_upper - 180
-
-                    vec1r = (siku_r.x - bahu_r.x, siku_r.y - bahu_r.y)
-                    vec2r = (pergelangan_r.x - siku_r.x, pergelangan_r.y - siku_r.y)
-                    angle_lower_r = math.degrees(math.atan2(vec2r[1], vec2r[0]) - math.atan2(vec1r[1], vec1r[0]))
-                    self.angle_r_lower = angle_lower_r
                 else:
                     self.pose_detected = False
-            else:
-                self.pose_detected = False
 
             with self.frame_lock:
                 self.current_frame = frame.copy()
@@ -103,121 +96,141 @@ class MocapAIThread(threading.Thread):
 
 
 # ==============================================================================
-# 2. URSINA SETUP
+# URSINA SETUP
 # ==============================================================================
 app = Ursina()
-window.title = "Motion Capture - Upper & Lower Arm"
+window.title = "Simple Motion Capture"
 window.borderless = False
 window.exit_button.visible = False
 
-avatar_container = Entity(position=(0.4, 0, 0))
-
+# Karakter
+avatar_container = Entity(position=(0.4, 1, 0))
+karakter = None
 try:
     karakter = Actor("karakter.glb")
     karakter.reparentTo(avatar_container)
     karakter.setScale(1.0)
-    print("[OK] Model loaded")
 except Exception as e:
-    print(f"[ERROR] Model gagal dimuat: {e}")
-    karakter = None
+    print(f"[ERROR] Model: {e}")
 
-# Webcam Display
+# Webcam
 panda_tex = PandaTexture()
 panda_tex.setup2dTexture(640, 480, PandaTexture.T_unsigned_byte, PandaTexture.F_rgb)
 cam_texture = Texture(panda_tex)
-
-Entity(
-    parent=camera.ui,
-    model='quad',
-    texture=cam_texture,
-    position=(-0.65, 0.3),
-    scale=(0.55, 0.4)
-)
+Entity(parent=camera.ui, model='quad', texture=cam_texture, position=(-0.65, 0.3), scale=(0.55, 0.4))
 
 # Joints
-bone_l_upper = None
-bone_l_lower = None
-bone_r_upper = None
-bone_r_lower = None
+l_upper = l_lower = r_upper = r_lower = None
 
-# ==============================================================================
-# 3. INIT JOINTS
-# ==============================================================================
 def init_joints():
-    global bone_l_upper, bone_l_lower, bone_r_upper, bone_r_lower
+    global l_upper, l_lower, r_upper, r_lower
     if not karakter: return
-    try:
-        bone_l_upper = karakter.controlJoint(None, "modelRoot", "J_Bip_L_UpperArm")
-        bone_l_lower = karakter.controlJoint(None, "modelRoot", "J_Bip_L_LowerArm")
-        bone_r_upper = karakter.controlJoint(None, "modelRoot", "J_Bip_R_UpperArm")
-        bone_r_lower = karakter.controlJoint(None, "modelRoot", "J_Bip_R_LowerArm")
-        print("[BERHASIL] Semua joint lengan berhasil dikontrol")
-        print(karakter.listJoints())
-    except:
-        print("[WARNING] Beberapa joint tidak ditemukan")
+    l_upper = karakter.controlJoint(None, "modelRoot", "J_Bip_L_UpperArm")
+    l_lower = karakter.controlJoint(None, "modelRoot", "J_Bip_L_LowerArm")
+    r_upper = karakter.controlJoint(None, "modelRoot", "J_Bip_R_UpperArm")
+    r_lower = karakter.controlJoint(None, "modelRoot", "J_Bip_R_LowerArm")
+    print("[OK] Joints terhubung")
 
 invoke(init_joints, delay=1.0)
 
-camera.position = (0.4, 1.5, -4)
+camera.position = (0.4, 1.7, -5)
 camera.lookAt(avatar_container)
 EditorCamera()
 
 # ==============================================================================
-# 4. UPDATE
+# UPDATE
 # ==============================================================================
-SMOOTH = 0.10
+
+# ==============================================================================
+# UI SLIDER UNTUK TUNING REAL-TIME
+# ==============================================================================
+# Buat text instruksi di layar
+Text(text="Gunakan Slider untuk Tuning Offset secara Real-Time", position=(-0.2, 0.45), scale=1.2)
+
+slider_l_upper = Slider(min=-180, max=180, default=L_UPPER_OFFSET, text='L Upper Offset', position=(0.2, -0.2), dynamic=True)
+slider_l_lower = Slider(min=-180, max=180, default=L_LOWER_OFFSET, text='L Lower Offset', position=(0.2, -0.25), dynamic=True)
+slider_r_upper = Slider(min=-180, max=180, default=R_UPPER_OFFSET, text='R Upper Offset', position=(0.2, -0.3), dynamic=True)
+slider_r_lower = Slider(min=-180, max=180, default=R_LOWER_OFFSET, text='R Lower Offset', position=(0.2, -0.35), dynamic=True)
+slider_smooth  = Slider(min=0.01, max=1.0, default=SMOOTH, text='Smooth Speed', position=(0.2, -0.4), dynamic=True)
+
+frame_count = 0
+tracking_was_active = False
+
+frame_count = 0
+tracking_was_active = False
+
+def normalize_angle(angle):
+    while angle > 180:
+        angle -= 360
+    while angle < -180:
+        angle += 360
+    return angle
 
 def update():
+    global frame_count, tracking_was_active, l_upper, l_lower, r_upper, r_lower
+    frame_count += 1
+
+    # Update Webcam Visual
     if ai_mocap.current_frame is not None:
         with ai_mocap.frame_lock:
             frame_copy = ai_mocap.current_frame.copy()
-        img_rgb = cv2.cvtColor(frame_copy, cv2.COLOR_BGR2RGB)
-        img_correct = cv2.flip(img_rgb, 0) 
-        panda_tex.setRamImage(img_correct.tobytes())
+            img_rgb = cv2.cvtColor(frame_copy, cv2.COLOR_BGR2RGB)
+            img_correct = cv2.flip(img_rgb, 0) 
+            panda_tex.setRamImage(img_correct.tobytes())
 
-    if not ai_mocap.pose_detected or not karakter:
+    if not karakter:
         return
-    
+
+    # Ambil nilai kelembutan gerakan langsung dari slider
+    current_smooth = slider_smooth.value
+
+    # --- LOGIKA SINKRONISASI ---
     if ai_mocap.pose_detected:
-        # Jika terdeteksi, gunakan sudut hasil tracking dari MediaPipe
-        target_l_upper = ai_mocap.angle_l_upper
-        target_l_lower = ai_mocap.angle_l_lower
-        target_r_upper = ai_mocap.angle_r_upper
-        target_r_lower = ai_mocap.angle_r_lower
+        if not tracking_was_active:
+            print("Tracking Regained -> Mengambil alih kendali joint kembali...")
+            init_joints()
+            tracking_was_active = True
+
+        # Ambil nilai target secara dinamis dari posisi SLIDER saat ini
+        if l_upper:
+            target = ai_mocap.l_upper + slider_l_upper.value
+            l_upper.setP(lerp(l_upper.getP(), target, current_smooth))
+
+        if l_lower:
+            target = -ai_mocap.l_lower + slider_l_lower.value
+            l_lower.setR(lerp(l_lower.getR(), target, current_smooth))
+
+        if r_upper:
+            target = -ai_mocap.r_upper + slider_r_upper.value
+            r_upper.setP(lerp(r_upper.getP(), target, current_smooth))
+
+        if r_lower:
+            target = -ai_mocap.r_lower + slider_r_lower.value
+            r_lower.setR(lerp(r_lower.getR(), target, current_smooth))
+
     else:
-        target_l_upper = 0.0
-        target_l_lower = 0.0
-        target_r_upper = 0.0
-        target_r_lower = 0.0
-    
-    # Lengan Kiri
-    if bone_l_upper and not bone_l_upper.isEmpty():
-        bone_l_upper.setP(lerp(bone_l_upper.getP(), target_l_upper, SMOOTH))
-
-    if bone_l_lower and not bone_l_lower.isEmpty():
-        bone_l_lower.setP(lerp(bone_l_lower.getP(), target_l_lower, SMOOTH))
-
-    # Lengan Kanan
-    if bone_r_upper and not bone_r_upper.isEmpty():
-        bone_r_upper.setP(lerp(bone_r_upper.getP(), target_r_upper, SMOOTH))
-
-    if bone_r_lower and not bone_r_lower.isEmpty():
-        bone_r_lower.setP(lerp(bone_r_lower.getP(), target_r_lower, SMOOTH))
-
+        if tracking_was_active:
+            print("Tracking Lost -> Melepaskan kendali joint...")
+            karakter.releaseJoint("modelRoot", "J_Bip_L_UpperArm")
+            karakter.releaseJoint("modelRoot", "J_Bip_L_LowerArm")
+            karakter.releaseJoint("modelRoot", "J_Bip_R_UpperArm")
+            karakter.releaseJoint("modelRoot", "J_Bip_R_LowerArm")
+            l_upper = l_lower = r_upper = r_lower = None
+            tracking_was_active = False
 
 def on_destroy():
     ai_mocap.running = False
     ai_mocap.join(timeout=1)
 
+
 # ==============================================================================
-# RUN
-# ==============================================================================
-ai_mocap = MocapAIThread()
+ai_mocap = MocapThread()
 ai_mocap.start()
 
-print("="*70)
-print("Motion Capture dengan Upper + Lower Arm AKTIF")
-print("Coba tekuk siku kamu sekarang")
-print("="*70)
+print("="*60)
+print("SIMPLE MOTION CAPTURE")
+print("Gerakkan tangan kamu di depan webcam")
+print("Ubah OFFSET di atas jika gerakan tidak cocok")
+print("="*60)
 
 app.run()
