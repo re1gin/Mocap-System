@@ -45,8 +45,6 @@ class MocapThread(threading.Thread):
         
         self.head_roll = 0.0
         self.spine_roll = 0.0
-        self.r_hand_flipped = False
-        self.l_hand_flipped = False
         
         self.current_frame = None
 
@@ -101,14 +99,13 @@ class MocapThread(threading.Thread):
                     self.head_roll = normalize_angle(math.degrees(math.atan2(lm[7].y - lm[8].y, lm[7].x - lm[8].x)))
                     
                     # Spine
-                    center_shoulder_x = (lm[11].x + lm[12].x) / 2
-                    center_shoulder_y = (lm[11].y + lm[12].y) / 2
-                    center_hip_x = (lm[23].x + lm[24].x) / 2
-                    center_hip_y = (lm[23].y + lm[24].y) / 2
-                    self.spine_roll = normalize_angle(
-                        math.degrees(math.atan2(
-                            center_hip_y - center_shoulder_y, center_hip_x - center_shoulder_x)) 
-                        - 90)
+                    shoulder_angle = math.degrees(math.atan2(
+                        lm[12].y - lm[11].y,
+                        lm[12].x - lm[11].x
+                    ))
+
+                    target_spine = normalize_angle(shoulder_angle)
+                    self.spine_roll = lerp(self.spine_roll,target_spine,0.1)
 
                 else:
                     self.pose_detected = False
@@ -116,7 +113,7 @@ class MocapThread(threading.Thread):
             with self.frame_lock:
                 self.current_frame = frame.copy()
 
-            time.sleep(0.001)
+            time.sleep(0.016)
 
         self.cap.release()
 
@@ -143,7 +140,12 @@ except Exception as e:
 panda_tex = PandaTexture()
 panda_tex.setup2dTexture(640, 480, PandaTexture.T_unsigned_byte, PandaTexture.F_rgb)
 cam_texture = Texture(panda_tex)
-Entity(parent=camera.ui, model='quad', texture=cam_texture, position=(-0.65, 0.3), scale=(0.55, 0.4))
+Entity(parent=camera.ui, 
+       model='quad',
+       texture=cam_texture,
+       position=(-0.65, 0.3),
+       scale=(0.55, 0.4)
+       )
 
 # Joints
 l_upper = l_lower = l_hand = r_upper = r_lower = r_hand = c_head = c_spine = None
@@ -177,13 +179,13 @@ EditorCamera()
 # Buat text instruksi di layar
 Text(text="Gunakan Slider untuk Tuning Offset secara Real-Time", position=(-0.2, 0.45), scale=1.2)
 
-slider_head    = Slider(min=-180, max=180, default=HEAD_OFFSET, text='Head Offset', position=(0.2, -0.1), dynamic=True)
-slider_spine   = Slider(min=-180, max=180, default=SPINE_OFFSET, text='Spine Offset', position=(0.2, -0.15), dynamic=True)
-slider_l_upper = Slider(min=-180, max=180, default=L_UPPER_OFFSET, text='L Upper Offset', position=(0.2, -0.2), dynamic=True)
-slider_l_lower = Slider(min=-180, max=180, default=L_LOWER_OFFSET, text='L Lower Offset', position=(0.2, -0.25), dynamic=True)
-slider_r_upper = Slider(min=-180, max=180, default=R_UPPER_OFFSET, text='R Upper Offset', position=(0.2, -0.3), dynamic=True)
-slider_r_lower = Slider(min=-180, max=180, default=R_LOWER_OFFSET, text='R Lower Offset', position=(0.2, -0.35), dynamic=True)
-slider_smooth  = Slider(min=0.01, max=1.0, default=SMOOTH, text='Smooth Speed', position=(0.2, -0.4), dynamic=True)
+slider_smooth  = Slider(min=0.01, max=1.0, default=SMOOTH, text='Smooth Speed', position=(0.1, 0.1), dynamic=True)
+
+# Kontrol Rotasi Spesifik Lengan & Pergelangan Tangan
+slider_hand_target = Slider(min=-180, max=180, default=90, text='Total Rotation Angle', position=(0.3, -0.3), dynamic=True)
+slider_hand_axis   = Slider(min=1, max=3, default=3, text='Twist Axis (1:H, 2:P, 3:R)', position=(0.3, -0.35), dynamic=True)
+slider_arm_ratio   = Slider(min=0.0, max=1.0, default=0.4, text='LowerArm Weight Ratio', position=(0.3, -0.4), dynamic=True)
+slider_invert      = Slider(min=-1, max=1, default=1, text='Invert Direction (-1 atau 1)', position=(0.3, -0.45), dynamic=True)
 
 frame_count = 0
 tracking_was_active = False
@@ -213,7 +215,7 @@ def normalize_angle(angle):
     return angle
 
 def update():
-    global frame_count, tracking_was_active, l_upper, l_lower, r_upper, r_lower
+    global frame_count, tracking_was_active, l_upper, l_lower, r_upper, r_lower, l_hand, r_hand, c_head, c_spine
     frame_count += 1
 
     # Update Webcam Visual
@@ -238,44 +240,65 @@ def update():
             tracking_was_active = True
             
         if c_head:
-            target_head = ai_mocap.head_roll + slider_head.value
-            c_head.setR(lerp(c_head.getR(), target_head, current_smooth))
-
-        if c_spine:
-            target_spine = ai_mocap.spine_roll + slider_spine.value
-            c_spine.setR(lerp(c_spine.getR(), target_spine, current_smooth))
+            target = ai_mocap.head_roll
+            c_head.setR(lerp(c_head.getR(), target, current_smooth))
             
         if l_upper:
-            target = ai_mocap.l_upper + slider_l_upper.value
+            target = ai_mocap.l_upper + 90
             l_upper.setP(lerp(l_upper.getP(), target, current_smooth))
-
+        
         if l_lower:
-            target = -ai_mocap.l_lower + slider_l_lower.value
+            target = -ai_mocap.l_lower + 0
             l_lower.setP(lerp(l_lower.getP(), target, current_smooth))
             
-        if l_hand:
-            wrist_target = clamp(ai_mocap.l_upper * 0.5, -45, 45)
-            l_hand.setR(lerp(l_hand.getR(), wrist_target, current_smooth))
-
         if r_upper:
-            target = -ai_mocap.r_upper + slider_r_upper.value
+            target = -ai_mocap.r_upper + 90
             r_upper.setP(lerp(r_upper.getP(), target, current_smooth))
-
+            
         if r_lower:
-            target = -ai_mocap.r_lower + slider_r_lower.value
+            target = -ai_mocap.r_lower + 0
             r_lower.setP(lerp(r_lower.getP(), target, current_smooth))
             
+        siku_kiri_menekuk = abs(ai_mocap.l_lower) > 60
+        siku_kanan_menekuk = abs(ai_mocap.r_lower) > 60
+        
+        hand_target_angle = slider_hand_target.value
+        axis_pilihan = int(slider_hand_axis.value)
+        
+        rotasi_hand      = hand_target_angle * 0.60
+        
+        if l_hand:
+            # Telapak tangan merespon murni sumbu pilihan dari slider
+            target_hand_l = rotasi_hand if siku_kiri_menekuk else 0
+            if axis_pilihan == 1:
+                l_hand.setH(lerp(l_hand.getH(), target_hand_l, current_smooth))
+            elif axis_pilihan == 2:
+                l_hand.setP(lerp(l_hand.getP(), target_hand_l, current_smooth))
+            elif axis_pilihan == 3:
+                l_hand.setR(lerp(l_hand.getR(), target_hand_l, current_smooth))
+
         if r_hand:
-            wrist_target = clamp(ai_mocap.r_lower * 0.5, -45, 45)
-            r_hand.setH(lerp(r_hand.getH(), wrist_target, current_smooth))
+            target_hand_r = rotasi_hand if siku_kanan_menekuk else 0
+            if axis_pilihan == 1:
+                r_hand.setH(lerp(r_hand.getH(), target_hand_r, current_smooth))
+            elif axis_pilihan == 2:
+                r_hand.setP(lerp(r_hand.getP(), target_hand_r, current_smooth))
+            elif axis_pilihan == 3:
+                r_hand.setR(lerp(r_hand.getR(), target_hand_r, current_smooth))
+                
+        if c_spine:
+            target = ai_mocap.spine_roll
+            c_spine.setR(lerp(c_spine.getR(), target, current_smooth))
     else:
         if tracking_was_active:
             print("Tracking Lost -> Melepaskan kendali joint...")
             karakter.releaseJoint("modelRoot", "J_Bip_L_UpperArm")
             karakter.releaseJoint("modelRoot", "J_Bip_L_LowerArm")
+            karakter.releaseJoint("modelRoot", "J_Bip_L_Hand")
             karakter.releaseJoint("modelRoot", "J_Bip_R_UpperArm")
             karakter.releaseJoint("modelRoot", "J_Bip_R_LowerArm")
-            l_upper = l_lower = r_upper = r_lower = None
+            karakter.releaseJoint("modelRoot", "J_Bip_R_Hand")
+            l_upper = l_lower = l_hand = r_upper = r_lower = r_hand = None
             tracking_was_active = False
 
 def on_destroy():
