@@ -11,9 +11,8 @@ from panda3d.core import Texture as PandaTexture
 # 1. KONFIGURASI GLOBAL & UTILITAS
 # ==============================================================================
 SMOOTH = 0.25
-DEADZONE = 0.5
-TORSO_GAIN = 1.0
-# Nilai alpha untuk filter (0.0 - 1.0). Semakin kecil = semakin halus, tapi sedikit lambat.
+DEADZONE = 0.2
+TORSO_GAIN = 3.0
 SMOOTH_FILTER_ALPHA = 0.15 
 
 def angle_between(v1, v2):
@@ -62,9 +61,9 @@ class MocapThread(threading.Thread):
         self.l_lower = 0.0
         self.r_upper = 0.0
         self.r_lower = 0.0
-        self.upperchest_roll = 0.0
+        self.spine_roll = 0.0
         
-        self.upperchest_center = None
+        self.spine_center = None
         self.current_frame = None
 
     def run(self):
@@ -99,18 +98,18 @@ class MocapThread(threading.Thread):
                     # Shoulder-Hip Vectors
                     shoulder_center = ((lm[11].x + lm[12].x) / 2, (lm[11].y + lm[12].y) / 2)
                     hip_center = ((lm[23].x + lm[24].x) / 2, (lm[23].y + lm[24].y) / 2)
-                    upperchest_vec = (shoulder_center[0] - hip_center[0], shoulder_center[1] - hip_center[1])
+                    spine_vec = (shoulder_center[0] - hip_center[0], shoulder_center[1] - hip_center[1])
                     
                     # --- 1. KALKULASI DATA MENTAH (RAW) UNTUK HEAD & TORSO ---
                     raw_head_roll = normalize_angle(math.degrees(math.atan2(head_vec[1], head_vec[0])))
-                    upperchest_angle = math.degrees(math.atan2(upperchest_vec[0], -upperchest_vec[1]))
+                    spine_angle = math.degrees(math.atan2(spine_vec[0], -spine_vec[1]))
                     
-                    if self.upperchest_center is None:
-                        self.upperchest_center = upperchest_angle
-                        print(f"[CALIBRATION] Pusat tegap torso terkunci di: {self.upperchest_center:.2f}°")
+                    if self.spine_center is None:
+                        self.spine_center = spine_angle
+                        print(f"[CALIBRATION] Pusat tegap torso terkunci di: {self.spine_center:.2f}°")
                     
-                    relative_angle = normalize_angle(upperchest_angle - self.upperchest_center)
-                    raw_upperchest_roll = max(-30, min(30, relative_angle))
+                    relative_angle = normalize_angle(spine_angle - self.spine_center)
+                    raw_spine_roll = max(-45, min(45, relative_angle))
                     
                     # ==============================================================================
                     # SOLUSI BARU: ROTASI VEKTOR SEJAJAR BAHU (ANTI-FLIP / ANTI-PUTAR BALIK)
@@ -147,7 +146,7 @@ class MocapThread(threading.Thread):
                     self.l_lower         = low_pass_filter(raw_l_lower, self.l_lower, alpha)
                     self.r_upper         = low_pass_filter(raw_r_upper, self.r_upper, alpha)
                     self.r_lower         = low_pass_filter(raw_r_lower, self.r_lower, alpha)
-                    self.upperchest_roll = low_pass_filter(raw_upperchest_roll, self.upperchest_roll, alpha)
+                    self.spine_roll = low_pass_filter(raw_spine_roll, self.spine_roll, alpha)
                     
                 else:
                     self.pose_detected = False
@@ -192,10 +191,10 @@ panda_tex.setup2dTexture(640, 480, PandaTexture.T_unsigned_byte, PandaTexture.F_
 cam_texture = Texture(panda_tex)
 Entity(parent=camera.ui, model='quad', texture=cam_texture, position=(-0.65, 0.3), scale=(0.55, 0.4))
 
-l_upper = l_lower = l_hand = r_upper = r_lower = r_hand = c_head = c_upperchest = None
+l_upper = l_lower = l_hand = r_upper = r_lower = r_hand = c_head = c_spine = None
 
 def init_joints():
-    global l_upper, l_lower, l_hand, r_upper, r_lower, r_hand, c_head, c_upperchest
+    global l_upper, l_lower, l_hand, r_upper, r_lower, r_hand, c_head, c_spine
     if not karakter: return
     l_upper = karakter.controlJoint(None, "modelRoot", "J_Bip_L_UpperArm")
     l_lower = karakter.controlJoint(None, "modelRoot", "J_Bip_L_LowerArm")
@@ -203,8 +202,8 @@ def init_joints():
     r_upper = karakter.controlJoint(None, "modelRoot", "J_Bip_R_UpperArm")
     r_lower = karakter.controlJoint(None, "modelRoot", "J_Bip_R_LowerArm")
     r_hand = karakter.controlJoint(None, "modelRoot", "J_Bip_R_Hand")
-    c_head = karakter.controlJoint(None, "modelRoot", "J_Bip_Head")
-    c_upperchest = karakter.controlJoint(None, "modelRoot", "J_Bip_C_UpperChest")
+    c_head = karakter.controlJoint(None, "modelRoot", "J_Bip_C_Head")
+    c_spine = karakter.controlJoint(None, "modelRoot", "J_Bip_C_Spine")
     print("[OK] Joints berhasil terhubung.")
 
 invoke(init_joints, delay=1.0)
@@ -223,7 +222,7 @@ tracking_was_active = False
 # 5. LOOP UPDATE UTAMA
 # ==============================================================================
 def update():
-    global tracking_was_active, l_upper, l_lower, l_hand, r_upper, r_lower, r_hand, c_head, c_upperchest
+    global tracking_was_active, l_upper, l_lower, l_hand, r_upper, r_lower, r_hand, c_head, c_spine
     
     if ai_mocap.current_frame is not None:
         with ai_mocap.frame_lock:
@@ -245,7 +244,7 @@ def update():
             tracking_was_active = True
             
         if c_head:
-            c_head.setP(lerp(c_head.getP(), ai_mocap.head_roll, current_smooth))
+            c_head.setR(lerp(c_head.getR(), ai_mocap.head_roll, current_smooth))
             
         if l_upper:
             l_upper.setP(lerp(l_upper.getP(), ai_mocap.l_upper + 90, current_smooth))
@@ -254,8 +253,6 @@ def update():
             l_lower.setP(lerp(l_lower.getP(), -ai_mocap.l_lower, current_smooth))
             
         if r_upper:
-            # Sumbu model 3D kanan Ursina biasanya berkebalikan arah rotasi p-nya terhadap kiri.
-            # Jika tangan kanan bergerak ke arah sebaliknya dari kiri, Anda bisa ubah tanda minus (-) di depan ai_mocap.r_upper
             r_upper.setP(lerp(r_upper.getP(), -ai_mocap.r_upper + 90, current_smooth))
             
         if r_lower:
@@ -285,15 +282,14 @@ def update():
             elif axis_pilihan == 3: 
                 r_hand.setR(lerp(r_hand.getR(), target_hand_r, current_smooth))
                 
-        if c_upperchest:
-            raw = ai_mocap.upperchest_roll
+        if c_spine:
+            raw = ai_mocap.spine_roll
             if abs(raw) < DEADZONE:
                 filtered_angle = 0.0
             else:
                 filtered_angle = math.copysign(abs(raw) - DEADZONE, raw)
                 filtered_angle *= TORSO_GAIN
-            
-            c_upperchest.setR(lerp(c_upperchest.getR(), filtered_angle, current_smooth))
+            c_spine.setR(lerp(c_spine.getR(), filtered_angle, current_smooth))
     else:
         if tracking_was_active:
             print("Tracking Lost -> Melepaskan kendali joint...")
@@ -303,9 +299,9 @@ def update():
             karakter.releaseJoint("modelRoot", "J_Bip_R_UpperArm")
             karakter.releaseJoint("modelRoot", "J_Bip_R_LowerArm")
             karakter.releaseJoint("modelRoot", "J_Bip_R_Hand")
-            karakter.releaseJoint("modelRoot", "J_Bip_Head")
-            karakter.releaseJoint("modelRoot", "J_Bip_C_UpperChest")
-            l_upper = l_lower = l_hand = r_upper = r_lower = r_hand = c_upperchest = None
+            karakter.releaseJoint("modelRoot", "J_Bip_C_Head")
+            karakter.releaseJoint("modelRoot", "J_Bip_C_Spine")
+            l_upper = l_lower = l_hand = r_upper = r_lower = r_hand = c_head = c_spine = None
             tracking_was_active = False
 
 def on_destroy():
