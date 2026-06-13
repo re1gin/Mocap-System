@@ -7,13 +7,10 @@ from ursina import *
 from direct.actor.Actor import Actor
 from panda3d.core import Texture as PandaTexture
 
-# --- KONSTANTA & TUNING PARAMETER ---
 SMOOTH = 0.25
 DEADZONE = 0.2
-ARM_DEADZONE = 3.0       # Saran 6: Deadzone untuk meminimalisir getaran mikro lengan
 TORSO_GAIN = 3.0
 SMOOTH_FILTER_ALPHA = 0.15 
-MAX_JUMP = 45.0          # Saran 3 & 8: Batas lompatan sudut maksimum untuk reject outlier
 
 def angle_between(v1, v2):
     dot = v1[0] * v2[0] + v1[1] * v2[1]
@@ -29,7 +26,6 @@ def angle_between(v1, v2):
 
 def signed_angle_between(v1, v2):
     raw_ang = angle_between(v1, v2)
-    # Cross product 2D untuk menentukan arah lipatan siku
     cross_product = v1[0] * v2[1] - v1[1] * v2[0]
     if cross_product < 0:
         return -raw_ang
@@ -40,13 +36,10 @@ def normalize_angle(angle):
     while angle < -180: angle += 360
     return angle
 
-# Saran 2: Interpolasi linear khusus sudut (Mencegah patah/mengamuk saat melewati 180/-180)
-def angle_lerp(current, target, alpha):
-    if current is None:
-        return target
-    diff = normalize_angle(target - current)
-    return current + diff * alpha
-
+def low_pass_filter(current_val, previous_val, alpha):
+    if previous_val is None:
+        return current_val
+    return alpha * current_val + (1 - alpha) * previous_val
 
 class MocapThread(threading.Thread):
     def __init__(self):
@@ -54,21 +47,14 @@ class MocapThread(threading.Thread):
         self.cap = cv2.VideoCapture(0)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self.cap.set(cv2.CAP_PROP_FPS, 30) # Saran 5: Memaksa webcam mengunci frame rate
         
         self.mp_pose = mp.solutions.pose
-        # Saran 4: Mengaktifkan smooth_landmarks bawaan MediaPipe
-        self.pose = self.mp_pose.Pose(
-            min_detection_confidence=0.7, 
-            min_tracking_confidence=0.7,
-            smooth_landmarks=True
-        )
+        self.pose = self.mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7)
         
         self.pose_detected = False
         self.running = True
         self.frame_lock = threading.Lock()
         
-        # Inisialisasi awal koordinat sudut
         self.head_roll = 0.0
         self.l_upper = 0.0
         self.l_lower = 0.0
@@ -93,9 +79,7 @@ class MocapThread(threading.Thread):
             if results.pose_landmarks:
                 lm = results.pose_landmarks.landmark
                 joint_indices = [11, 12, 13, 14, 15, 16, 17, 18, 23, 24, 7, 8]
-                
-                # Saran 1: Menaikkan visibility threshold ke 0.85 agar data outlier tersaring awal
-                if all(lm[i].visibility > 0.85 for i in joint_indices):
+                if all(lm[i].visibility > 0.7 for i in joint_indices):
                     self.pose_detected = True
                     mp_drawing.draw_landmarks(frame, results.pose_landmarks, self.mp_pose.POSE_CONNECTIONS)
                     
@@ -115,7 +99,7 @@ class MocapThread(threading.Thread):
                     hip_center = ((lm[23].x + lm[24].x) / 2, (lm[23].y + lm[24].y) / 2)
                     spine_vec = (shoulder_center[0] - hip_center[0], shoulder_center[1] - hip_center[1])
                     
-                    # --- KALKULASI DATA MENTAH (RAW) ---
+                    # --- 1. KALKULASI DATA MENTAH (RAW) UNTUK HEAD & TORSO ---
                     raw_head_roll = normalize_angle(math.degrees(math.atan2(head_vec[1], head_vec[0])))
                     spine_angle = math.degrees(math.atan2(spine_vec[0], -spine_vec[1]))
                     
@@ -126,7 +110,7 @@ class MocapThread(threading.Thread):
                     relative_angle = normalize_angle(spine_angle - self.spine_center)
                     raw_spine_roll = max(-45, min(45, relative_angle))
                     
-                    # --- ROTASI VEKTOR SEJAJAR BAHU ---
+                    # --- 2. ROTASI VEKTOR SEJAJAR BAHU ---
                     rad = math.radians(-relative_angle)
                     cos_r = math.cos(rad)
                     sin_r = math.sin(rad)
@@ -139,33 +123,26 @@ class MocapThread(threading.Thread):
                     r_u_x = r_upper_vec[0] * cos_r - r_upper_vec[1] * sin_r
                     r_u_y = r_upper_vec[0] * sin_r + r_upper_vec[1] * cos_r
                     
-                    # Ambil sudut rotasi bahu
+                    # --- PERUBAHAN: HAPUS LIMITASI CLAMP AGAR BISA BEBAS BERPUTAR (360°) ---
                     l_upper_angle = math.degrees(math.atan2(l_u_y, l_u_x))
                     raw_l_upper = normalize_angle(-l_upper_angle - 90)
+                    
+                    # Gunakan signed_angle_between agar siku tahu kapan harus melipat ke dalam/luar
                     raw_l_lower = signed_angle_between(l_upper_vec, l_lower_vec)
 
                     r_upper_angle = math.degrees(math.atan2(r_u_y, r_u_x))
                     raw_r_upper = normalize_angle(-r_upper_angle - 90)
+                    
+                    # Menggunakan signed_angle_between untuk tangan kanan
                     raw_r_lower = signed_angle_between(r_upper_vec, r_lower_vec)
 
-                    # Saran 6: Implementasi ARM_DEADZONE untuk menstabilkan pose lengan saat diam
-                    if abs(raw_l_upper) < ARM_DEADZONE: raw_l_upper = 0.0
-                    if abs(raw_r_upper) < ARM_DEADZONE: raw_r_upper = 0.0
-
-                    # Saran 3 & 8: Reject Outlier jika terjadi lonjakan sudut tak wajar dalam waktu singkat
-                    if abs(normalize_angle(raw_l_upper - self.l_upper)) > MAX_JUMP: raw_l_upper = self.l_upper
-                    if abs(normalize_angle(raw_l_lower - self.l_lower)) > MAX_JUMP: raw_l_lower = self.l_lower
-                    if abs(normalize_angle(raw_r_upper - self.r_upper)) > MAX_JUMP: raw_r_upper = self.r_upper
-                    if abs(normalize_angle(raw_r_lower - self.r_lower)) > MAX_JUMP: raw_r_lower = self.r_lower
-
-                    # Aplikasikan Filter menggunakan angle_lerp (Saran 2)
                     alpha = SMOOTH_FILTER_ALPHA
-                    self.head_roll  = angle_lerp(self.head_roll, raw_head_roll, alpha)
-                    self.l_upper    = angle_lerp(self.l_upper, raw_l_upper, alpha)
-                    self.l_lower    = angle_lerp(self.l_lower, raw_l_lower, alpha)
-                    self.r_upper    = angle_lerp(self.r_upper, raw_r_upper, alpha)
-                    self.r_lower    = angle_lerp(self.r_lower, raw_r_lower, alpha)
-                    self.spine_roll = angle_lerp(self.spine_roll, raw_spine_roll, alpha)
+                    self.head_roll       = low_pass_filter(raw_head_roll, self.head_roll, alpha)
+                    self.l_upper         = low_pass_filter(raw_l_upper, self.l_upper, alpha)
+                    self.l_lower         = low_pass_filter(raw_l_lower, self.l_lower, alpha)
+                    self.r_upper         = low_pass_filter(raw_r_upper, self.r_upper, alpha)
+                    self.r_lower         = low_pass_filter(raw_r_lower, self.r_lower, alpha)
+                    self.spine_roll = low_pass_filter(raw_spine_roll, self.spine_roll, alpha)
                     
                 else:
                     self.pose_detected = False
@@ -177,19 +154,27 @@ class MocapThread(threading.Thread):
 
         self.cap.release()
 
-# --- INITIALIZE BACKEND MOCAP ---
+# INISIALISASI THREAD
 ai_mocap = MocapThread()
 ai_mocap.start()
 
 # ==============================================================================
-# URSINA ENGINE SETUP
+# 3. URSINA ENGINE SETUP
 # ==============================================================================
 app = Ursina()
-window.title = "Simple Motion Capture - Optimized"
+window.title = "Mocap Viewport Studio"
 window.borderless = False
 window.exit_button.visible = False
 
-# Setup Avatar Container
+# PERUBAHAN: Set background gelap & tambahkan atmosfer kabut software 3D
+window.color = color.dark_gray
+scene.fog_color = color.dark_gray
+scene.fog_density = (4, 18)
+
+Entity(model='line', scale=(6,1,1), color=color.red, position=(0.4, 1, 0))
+Entity(model='line', scale=(6,1,1), color=color.blue, rotation_y=90, position=(0.4, 1, 0))
+
+# Setup Avatar
 avatar_container = Entity(position=(0.4, 1, 0))
 karakter = None
 try:
@@ -200,7 +185,7 @@ except Exception as e:
     print(f"[ERROR] Gagal memuat Model: {e}")
 
 # Camera Setup
-camera.position = (0.4, 1.7, -5)
+camera.position = (0.4, 1.7, -6)
 camera.lookAt(avatar_container)
 EditorCamera()
 
@@ -227,15 +212,17 @@ def init_joints():
 
 invoke(init_joints, delay=1.0)
 
-# Interface / UI Slider
-Text(text="Gunakan Slider untuk Tuning Offset secara Real-Time", position=(-0.2, 0.45), scale=1.2)
-slider_smooth      = Slider(min=0.01, max=1.0, default=SMOOTH, text='Smooth Speed', position=(0.3, -0.25), dynamic=True)
-slider_hand_target = Slider(min=-180, max=180, default=90, text='Total Rotation Angle', position=(0.3, -0.3), dynamic=True)
+# ==============================================================================
+# 4. INTERFACE / UI SLIDER
+# ==============================================================================
 
+# PERUBAHAN: Hanya menyimpan Slider Smooth Speed tepat di bawah tampilan kamera webcam
+Text(text="Gunakan Slider untuk Tuning Offset secara Real-Time", position=(-0.85, -0.15), scale=1.0)
+slider_smooth = Slider(min=0.01, max=1.0, default=SMOOTH, text='Smooth Speed', position=(-0.65, -0.25), dynamic=True)
 tracking_was_active = False
 
 # ==============================================================================
-# MAIN ENGINE LOOP (UPDATE)
+# 5. LOOP UPDATE UTAMA
 # ==============================================================================
 def update():
     global tracking_was_active, l_upper, l_lower, l_hand, r_upper, r_lower, r_hand, c_head, c_spine
@@ -243,13 +230,15 @@ def update():
     if ai_mocap.current_frame is not None:
         with ai_mocap.frame_lock:
             frame_copy = ai_mocap.current_frame.copy()
+            
             img_correct = cv2.flip(frame_copy, 0) 
             panda_tex.setRamImage(img_correct.tobytes())
 
     if not karakter:
         return
 
-    s = slider_smooth.value
+    current_smooth = slider_smooth.value
+    s = current_smooth
 
     if ai_mocap.pose_detected:
         if not tracking_was_active:
@@ -278,14 +267,16 @@ def update():
             l_upper.setR(lerp(l_upper.getR(), ai_mocap.l_upper * -0.25, s*0.4))  
 
         if l_lower:
+            # Mengikuti arah tekukan riil (bisa positif/negatif)
             l_lower.setP(lerp(l_lower.getP(), -ai_mocap.l_lower, s))
             
         # ================== Lengan Kanan ==================
         if r_upper:
             r_upper.setP(lerp(r_upper.getP(), -ai_mocap.r_upper + 90, s))
-            r_upper.setR(lerp(r_upper.getR(), ai_mocap.r_upper * 0.25, s*0.4))
+            r_upper.setR(lerp(r_upper.getR(), ai_mocap.r_upper * -0.25, s*0.4))
 
         if r_lower:
+            # Mengikuti arah tekukan riil (bisa positif/negatif)
             r_lower.setP(lerp(r_lower.getP(), ai_mocap.r_lower, s))
             
         # ================== Tangan (Twist) ==================
@@ -293,14 +284,14 @@ def update():
             siku_kiri_menekuk = abs(ai_mocap.l_lower) > 35
             siku_kanan_menekuk = abs(ai_mocap.r_lower) > 35 
             
-            rotasi = slider_hand_target.value * 0.65
+            rotasi = 90 * 0.65 * 0.65
             
             if l_hand:
                 target = rotasi if siku_kiri_menekuk else 15
                 l_hand.setR(lerp(l_hand.getR(), target, s))
 
             if r_hand:
-                target = rotasi if siku_kanan_menekuk else 15
+                target = -rotasi if siku_kanan_menekuk else 15
                 r_hand.setR(lerp(r_hand.getR(), target, s))
                 
     else:
@@ -322,6 +313,6 @@ def on_destroy():
     ai_mocap.join(timeout=1)
 
 print("="*60)
-print("SIMPLE MOTION CAPTURE WITH ANTI-JITTER ALGORITHMS RUNNING...")
+print("SIMPLE MOTION CAPTURE WITH UNLOCKED ARMS RUNNING...")
 print("="*60)
 app.run()
